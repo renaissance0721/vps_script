@@ -686,6 +686,46 @@ get_ssh_option() {
   ' "$file" 2>/dev/null
 }
 
+format_enabled_status() {
+  local value="${1:-}"
+  local default_value="${2:-no}"
+
+  if [ -z "$value" ]; then
+    value="$default_value"
+  fi
+
+  case "$value" in
+    yes|Yes|YES|true|True|TRUE|on|On|ON)
+      printf '%b\n' "${GREEN}开启${RESET}"
+      ;;
+    no|No|NO|false|False|FALSE|off|Off|OFF)
+      printf '%b\n' "${RED}关闭${RESET}"
+      ;;
+    *)
+      printf '%b\n' "${YELLOW}${value}${RESET}"
+      ;;
+  esac
+}
+
+print_ssh_auth_status() {
+  local config_file
+  local pubkey
+  local password
+
+  config_file="$(find_sshd_config)"
+  if [ -z "$config_file" ]; then
+    printf '%b\n' "${RED}密钥登录: 未知，未找到 sshd_config${RESET}"
+    printf '%b\n' "${RED}密码登录: 未知，未找到 sshd_config${RESET}"
+    return
+  fi
+
+  pubkey="$(get_ssh_option PubkeyAuthentication "$config_file")"
+  password="$(get_ssh_option PasswordAuthentication "$config_file")"
+
+  printf '密钥登录: %b\n' "$(format_enabled_status "$pubkey" yes)"
+  printf '密码登录: %b\n' "$(format_enabled_status "$password" yes)"
+}
+
 set_ssh_option() {
   local key="$1"
   local value="$2"
@@ -1339,6 +1379,8 @@ ssh_key_login_menu() {
   while true; do
     clear_screen
     print_header
+    print_ssh_auth_status
+    print_separator
     printf '%s\n' '1. 生成新密钥对'
     printf '%s\n' '2. 手动输入已有公钥'
     printf '%s\n' '3. 从GitHub导入已有公钥'
@@ -1643,31 +1685,20 @@ remove_swapfile_from_fstab() {
 }
 
 show_swap_status() {
-  if [ -r /proc/swaps ]; then
-    cat /proc/swaps
-  else
-    printf '%s\n' '无法读取 /proc/swaps'
+  local total_kb="0"
+
+  if [ -r /proc/meminfo ]; then
+    total_kb="$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)"
   fi
+
+  printf '当前虚拟内存: %s M\n' "$((total_kb / 1024))"
 }
 
-modify_swap_size() {
-  local size_gb=""
-  local count_mb
+set_swap_size_mb() {
+  local size_mb="$1"
   local backup
 
-  clear_screen
-  print_header
-  show_swap_status
-  print_separator
-
   if ! require_root; then
-    pause
-    return
-  fi
-
-  read -r -p '请输入新的虚拟内存大小(GB，输入 0 删除 /swapfile): ' size_gb
-  if ! is_number "$size_gb"; then
-    printf '%b\n' "${RED}请输入数字。${RESET}"
     pause
     return
   fi
@@ -1685,21 +1716,20 @@ modify_swap_size() {
   remove_swapfile_from_fstab
   rm -f /swapfile
 
-  if [ "$size_gb" -eq 0 ]; then
+  if [ "$size_mb" -eq 0 ]; then
     printf '%b\n' "${GREEN}已删除 /swapfile 虚拟内存配置。${RESET}"
     [ -n "$backup" ] && printf 'fstab 备份: %s\n' "$backup"
     pause
     return
   fi
 
-  count_mb=$((size_gb * 1024))
-  printf '正在创建 %sGB swapfile...\n' "$size_gb"
+  printf '正在创建 %sM 虚拟内存...\n' "$size_mb"
 
   if ! {
     if command_exists fallocate; then
-      fallocate -l "${size_gb}G" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$count_mb"
+      fallocate -l "${size_mb}M" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$size_mb"
     else
-      dd if=/dev/zero of=/swapfile bs=1M count="$count_mb"
+      dd if=/dev/zero of=/swapfile bs=1M count="$size_mb"
     fi
   }; then
     rm -f /swapfile
@@ -1725,9 +1755,81 @@ modify_swap_size() {
 
   printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab
 
-  printf '%b\n' "${GREEN}虚拟内存已设置为 ${size_gb}GB。${RESET}"
+  printf '%b\n' "${GREEN}虚拟内存已设置为 ${size_mb}M。${RESET}"
   [ -n "$backup" ] && printf 'fstab 备份: %s\n' "$backup"
   pause
+}
+
+choose_swap_size_mb() {
+  local choice="$1"
+  local custom_size=""
+
+  case "$choice" in
+    1)
+      printf '%s\n' '256'
+      ;;
+    2)
+      printf '%s\n' '512'
+      ;;
+    3)
+      printf '%s\n' '1024'
+      ;;
+    4)
+      printf '%s\n' '2048'
+      ;;
+    5)
+      read -r -p '请输入自定义虚拟内存大小(M): ' custom_size
+      if ! is_number "$custom_size" || [ "$custom_size" -le 0 ]; then
+        printf '%b\n' "${RED}请输入大于 0 的数字。${RESET}"
+        return 1
+      fi
+      printf '%s\n' "$custom_size"
+      ;;
+    6)
+      printf '%s\n' '0'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+modify_swap_size() {
+  local choice=""
+  local size_mb=""
+
+  clear_screen
+  print_header
+  show_swap_status
+  print_separator
+  printf '%s\n' '1. 256M'
+  printf '%s\n' '2. 512M'
+  printf '%s\n' '3. 1024M'
+  printf '%s\n' '4. 2048M'
+  printf '%s\n' '5. 自定义'
+  printf '%s\n' '6. 删除虚拟内存'
+  printf '%s\n' '0. 返回上级菜单'
+  printf '%s\n' '00. 退出脚本'
+  print_footer
+
+  read -r -p '请输入选项: ' choice
+  case "$choice" in
+    0|r|R)
+      return 0
+      ;;
+    00)
+      printf '%b\n' "${GREEN}已退出。${RESET}"
+      exit 0
+      ;;
+  esac
+
+  if ! size_mb="$(choose_swap_size_mb "$choice")"; then
+    printf '%b\n' "${RED}无效选项。${RESET}"
+    pause
+    return
+  fi
+
+  set_swap_size_mb "$size_mb"
 }
 
 sysctl_get() {
