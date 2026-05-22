@@ -661,13 +661,12 @@ update_script() {
 
 show_menu() {
   clear_screen
-  print_header
+  printf '%b\n' "${CYAN}--------${SCRIPT_NAME} | 输入 r 一键打开脚本----------${RESET}"
   printf '%s\n' '1. 系统信息查询'
   printf '%s\n' '2. 节点管理'
   printf '%s\n' '3. Docker管理'
   printf '%s\n' '4. 系统工具'
   printf '%s\n' '5. 一键更新'
-  printf '%s\n' 'r. 打开菜单'
   printf '%s\n' '0. 退出'
   print_footer
 }
