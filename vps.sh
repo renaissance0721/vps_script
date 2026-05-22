@@ -5,6 +5,8 @@ set -Eeuo pipefail
 SCRIPT_NAME="VPS一键管理脚本"
 REPO="${REPO:-renaissance0721/vps_script}"
 BRANCH="${BRANCH:-main}"
+INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/vps}"
+SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/r}"
 SOURCE_URL="${SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/vps.sh}"
 
 if [ -t 1 ]; then
@@ -72,6 +74,17 @@ http_get() {
     curl -4fsSL --connect-timeout 4 --max-time 8 "$url"
   elif command_exists wget; then
     wget -qO- -T 8 -t 1 "$url"
+  else
+    return 1
+  fi
+}
+
+download_file() {
+  local url="$1"
+  local output="$2"
+
+  if command_exists curl; then
+    curl -fsSL --connect-timeout 8 --max-time 30 "$url" -o "$output"
   else
     return 1
   fi
@@ -586,6 +599,19 @@ require_root() {
   fi
 }
 
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif "$@" 2>/dev/null; then
+    return 0
+  elif command_exists sudo; then
+    sudo "$@"
+  else
+    printf '%b\n' "${RED}此操作需要 root 权限，请使用 root 用户执行或安装 sudo。${RESET}"
+    return 1
+  fi
+}
+
 is_number() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
@@ -866,12 +892,51 @@ get_current_ip_priority() {
   ' "$file"
 }
 
+has_ipv4() {
+  if command_exists ip && ip -4 addr show scope global 2>/dev/null | awk '/inet / { found = 1 } END { exit found ? 0 : 1 }'; then
+    return 0
+  fi
+
+  if command_exists ifconfig && ifconfig 2>/dev/null | awk '/inet / && $2 !~ /^127\./ { found = 1 } END { exit found ? 0 : 1 }'; then
+    return 0
+  fi
+
+  return 1
+}
+
+has_ipv6() {
+  if command_exists ip && ip -6 addr show scope global 2>/dev/null | awk '/inet6 / { found = 1 } END { exit found ? 0 : 1 }'; then
+    return 0
+  fi
+
+  if [ -r /proc/net/if_inet6 ] && awk '$4 == "00" { found = 1 } END { exit found ? 0 : 1 }' /proc/net/if_inet6; then
+    return 0
+  fi
+
+  return 1
+}
+
+print_ip_stack_status() {
+  if has_ipv4; then
+    printf '%b\n' "${GREEN}IPv4状态: 已检测到${RESET}"
+  else
+    printf '%b\n' "${RED}IPv4状态: 未检测到${RESET}"
+  fi
+
+  if has_ipv6; then
+    printf '%b\n' "${GREEN}IPv6状态: 已检测到${RESET}"
+  else
+    printf '%b\n' "${RED}IPv6状态: 未检测到${RESET}"
+  fi
+}
+
 switch_ip_priority() {
   local choice=""
 
   clear_screen
   print_header
   printf '当前优先: %s\n' "$(get_current_ip_priority)"
+  print_ip_stack_status
   print_separator
   printf '%s\n' '1. 优先 IPv4'
   printf '%s\n' '2. 优先 IPv6'
@@ -883,16 +948,26 @@ switch_ip_priority() {
   read -r -p '请输入选项: ' choice
   case "$choice" in
     1)
+      if ! has_ipv4; then
+        printf '%b\n' "${RED}未检测到可用 IPv4 地址，无法切换为优先 IPv4。${RESET}"
+        pause
+        return
+      fi
       set_gai_priority ipv4
       ;;
     2)
+      if ! has_ipv6; then
+        printf '%b\n' "${RED}未检测到可用 IPv6 地址，无法切换为优先 IPv6。${RESET}"
+        pause
+        return
+      fi
       set_gai_priority ipv6
       ;;
     3)
       set_gai_priority default
       ;;
     0)
-      return
+      return 0
       ;;
     00)
       printf '%b\n' "${GREEN}已退出。${RESET}"
@@ -1004,7 +1079,7 @@ ssh_key_login_menu() {
         set_ssh_login_mode password
         ;;
       0|r|R)
-        return
+        return 0
         ;;
       00)
         printf '%b\n' "${GREEN}已退出。${RESET}"
@@ -1247,7 +1322,7 @@ port_management_menu() {
         show_firewall_rules
         ;;
       0|r|R)
-        return
+        return 0
         ;;
       00)
         printf '%b\n' "${GREEN}已退出。${RESET}"
@@ -1486,7 +1561,7 @@ system_tools_menu() {
         enable_bbr3
         ;;
       0|r|R)
-        return
+        return 0
         ;;
       00)
         printf '%b\n' "${GREEN}已退出。${RESET}"
@@ -1501,6 +1576,8 @@ system_tools_menu() {
 }
 
 update_script() {
+  local tmp_file
+
   clear_screen
   print_header
 
@@ -1512,15 +1589,54 @@ update_script() {
     return
   fi
 
-  printf '%b\n' "${YELLOW}正在从 GitHub 拉取并运行最新脚本...${RESET}"
-  printf 'bash <(curl -fsSL %s)\n' "$SOURCE_URL"
-  print_footer
+  printf '%b\n' "${YELLOW}正在从 GitHub 下载最新脚本...${RESET}"
+  printf '来源: %s\n' "$SOURCE_URL"
 
-  if ! bash <(curl -fsSL "$SOURCE_URL"); then
-    printf '%b\n' "${RED}运行最新脚本失败，请检查网络或 GitHub 地址。${RESET}"
+  tmp_file="$(mktemp)"
+  if ! download_file "$SOURCE_URL" "$tmp_file"; then
+    rm -f "$tmp_file"
+    printf '%b\n' "${RED}下载失败，请检查网络或 GitHub 地址。${RESET}"
     pause
     return
   fi
+
+  if ! bash -n "$tmp_file"; then
+    rm -f "$tmp_file"
+    printf '%b\n' "${RED}最新脚本语法检查失败，已停止更新。${RESET}"
+    pause
+    return
+  fi
+
+  if ! run_as_root mkdir -p "$(dirname "$INSTALL_PATH")"; then
+    rm -f "$tmp_file"
+    pause
+    return
+  fi
+
+  if ! run_as_root cp "$tmp_file" "$INSTALL_PATH"; then
+    rm -f "$tmp_file"
+    printf '%b\n' "${RED}写入 ${INSTALL_PATH} 失败。${RESET}"
+    pause
+    return
+  fi
+
+  rm -f "$tmp_file"
+
+  if ! run_as_root chmod 0755 "$INSTALL_PATH"; then
+    printf '%b\n' "${RED}设置执行权限失败。${RESET}"
+    pause
+    return
+  fi
+
+  if run_as_root ln -sf "$INSTALL_PATH" "$SHORTCUT_PATH"; then
+    printf '%b\n' "${GREEN}更新完成。输入 vps 或 r 可打开脚本。${RESET}"
+  else
+    printf '%b\n' "${YELLOW}脚本已更新，但快捷命令 r 创建失败。${RESET}"
+  fi
+
+  print_footer
+  printf '%b\n' "${GREEN}正在启动最新脚本...${RESET}"
+  exec bash "$INSTALL_PATH"
 }
 
 show_menu() {
