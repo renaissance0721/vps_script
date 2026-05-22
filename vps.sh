@@ -595,6 +595,866 @@ placeholder() {
   pause
 }
 
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    printf '%b\n' "${RED}此功能需要 root 权限，请使用 root 用户执行脚本。${RESET}"
+    return 1
+  fi
+}
+
+is_number() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+valid_port() {
+  local port="${1:-}"
+
+  is_number "$port" && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+backup_file() {
+  local file="$1"
+  local backup=""
+
+  if [ -e "$file" ]; then
+    backup="${file}.bak.$(date '+%Y%m%d%H%M%S')"
+    cp -a "$file" "$backup"
+  fi
+
+  printf '%s\n' "$backup"
+}
+
+confirm_action() {
+  local message="$1"
+  local answer=""
+
+  if [ ! -t 0 ]; then
+    return 1
+  fi
+
+  read -r -p "${message} [y/N]: " answer
+  case "$answer" in
+    y|Y|yes|YES)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+find_sshd_config() {
+  if [ -f /etc/ssh/sshd_config ]; then
+    printf '%s\n' '/etc/ssh/sshd_config'
+  else
+    printf '%s\n' ''
+  fi
+}
+
+find_sshd_bin() {
+  local bin
+
+  for bin in /usr/sbin/sshd /usr/local/sbin/sshd sshd; do
+    if command_exists "$bin" || [ -x "$bin" ]; then
+      printf '%s\n' "$bin"
+      return
+    fi
+  done
+
+  printf '%s\n' ''
+}
+
+get_ssh_option() {
+  local key="$1"
+  local file="$2"
+
+  awk -v key="$key" '
+    $1 !~ /^#/ && $1 == key {
+      print $2
+      exit
+    }
+  ' "$file" 2>/dev/null
+}
+
+set_ssh_option() {
+  local key="$1"
+  local value="$2"
+  local file="$3"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done = 0 }
+    $0 ~ "^[[:space:]]*#?[[:space:]]*" key "[[:space:]]+" {
+      if (!done) {
+        print key " " value
+        done = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done) {
+        print key " " value
+      }
+    }
+  ' "$file" > "$tmp_file"
+  cat "$tmp_file" > "$file"
+  rm -f "$tmp_file"
+}
+
+test_sshd_config() {
+  local file="$1"
+  local sshd_bin
+
+  sshd_bin="$(find_sshd_bin)"
+  if [ -n "$sshd_bin" ]; then
+    "$sshd_bin" -t -f "$file"
+  else
+    return 0
+  fi
+}
+
+restart_service_by_names() {
+  local service_name
+
+  for service_name in "$@"; do
+    if command_exists systemctl && systemctl restart "$service_name" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if command_exists rc-service && rc-service "$service_name" restart >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if command_exists service && service "$service_name" restart >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if [ -x "/etc/init.d/${service_name}" ] && "/etc/init.d/${service_name}" restart >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+restart_ssh_service() {
+  restart_service_by_names sshd ssh
+}
+
+modify_ssh_port() {
+  local config_file
+  local current_port
+  local new_port
+  local backup
+
+  clear_screen
+  print_header
+
+  if ! require_root; then
+    pause
+    return
+  fi
+
+  config_file="$(find_sshd_config)"
+  if [ -z "$config_file" ]; then
+    printf '%b\n' "${RED}未找到 /etc/ssh/sshd_config。${RESET}"
+    pause
+    return
+  fi
+
+  current_port="$(get_ssh_option Port "$config_file")"
+  current_port="${current_port:-22}"
+  printf '当前 SSH 端口: %s\n' "$current_port"
+
+  read -r -p '请输入新的 SSH 端口(1-65535): ' new_port
+  if ! valid_port "$new_port"; then
+    printf '%b\n' "${RED}端口无效。${RESET}"
+    pause
+    return
+  fi
+
+  if ! confirm_action "确认将 SSH 端口修改为 ${new_port} 吗"; then
+    printf '%b\n' "${YELLOW}已取消。${RESET}"
+    pause
+    return
+  fi
+
+  backup="$(backup_file "$config_file")"
+  set_ssh_option Port "$new_port" "$config_file"
+
+  if ! test_sshd_config "$config_file"; then
+    [ -n "$backup" ] && cp -a "$backup" "$config_file"
+    printf '%b\n' "${RED}SSH 配置检查失败，已恢复备份。${RESET}"
+    pause
+    return
+  fi
+
+  open_firewall_port "$new_port" tcp silent || true
+
+  if restart_ssh_service; then
+    printf '%b\n' "${GREEN}SSH 端口已修改为 ${new_port}，请确认新端口可连接后再关闭当前 SSH 会话。${RESET}"
+  else
+    printf '%b\n' "${YELLOW}配置已写入，但 SSH 服务重启失败，请手动检查服务状态。${RESET}"
+  fi
+
+  [ -n "$backup" ] && printf '配置备份: %s\n' "$backup"
+  print_footer
+  pause
+}
+
+set_gai_priority() {
+  local mode="$1"
+  local file="/etc/gai.conf"
+  local tmp_file
+  local backup
+
+  if ! require_root; then
+    return 1
+  fi
+
+  [ -f "$file" ] || touch "$file"
+  backup="$(backup_file "$file")"
+  tmp_file="$(mktemp)"
+
+  awk '
+    /^[[:space:]]*#?[[:space:]]*precedence[[:space:]]+::ffff:0:0\/96[[:space:]]+/ { next }
+    /^[[:space:]]*#?[[:space:]]*precedence[[:space:]]+::\/0[[:space:]]+/ { next }
+    { print }
+  ' "$file" > "$tmp_file"
+
+  cat "$tmp_file" > "$file"
+  rm -f "$tmp_file"
+
+  {
+    printf '\n'
+    printf '# VPS script network priority\n'
+    if [ "$mode" = "ipv4" ]; then
+      printf 'precedence ::ffff:0:0/96  100\n'
+    else
+      printf 'precedence ::/0  100\n'
+      printf 'precedence ::ffff:0:0/96  10\n'
+    fi
+  } >> "$file"
+
+  if [ "$mode" = "ipv4" ]; then
+    printf '%b\n' "${GREEN}已设置为优先 IPv4。${RESET}"
+  else
+    printf '%b\n' "${GREEN}已设置为优先 IPv6。${RESET}"
+  fi
+
+  [ -n "$backup" ] && printf '配置备份: %s\n' "$backup"
+}
+
+switch_ip_priority() {
+  local choice=""
+
+  clear_screen
+  print_header
+  printf '%s\n' '1. 优先 IPv4'
+  printf '%s\n' '2. 优先 IPv6'
+  printf '%s\n' '0. 返回'
+  print_footer
+
+  read -r -p '请输入选项: ' choice
+  case "$choice" in
+    1)
+      set_gai_priority ipv4
+      ;;
+    2)
+      set_gai_priority ipv6
+      ;;
+    0)
+      return
+      ;;
+    *)
+      printf '%b\n' "${RED}无效选项。${RESET}"
+      ;;
+  esac
+
+  pause
+}
+
+show_ssh_login_status() {
+  local config_file
+  local pubkey
+  local password
+
+  config_file="$(find_sshd_config)"
+  if [ -z "$config_file" ]; then
+    printf '%b\n' "${RED}未找到 /etc/ssh/sshd_config。${RESET}"
+    return
+  fi
+
+  pubkey="$(get_ssh_option PubkeyAuthentication "$config_file")"
+  password="$(get_ssh_option PasswordAuthentication "$config_file")"
+
+  printf 'PubkeyAuthentication: %s\n' "${pubkey:-默认}"
+  printf 'PasswordAuthentication: %s\n' "${password:-默认}"
+}
+
+set_ssh_login_mode() {
+  local mode="$1"
+  local config_file
+  local backup
+
+  if ! require_root; then
+    pause
+    return
+  fi
+
+  config_file="$(find_sshd_config)"
+  if [ -z "$config_file" ]; then
+    printf '%b\n' "${RED}未找到 /etc/ssh/sshd_config。${RESET}"
+    pause
+    return
+  fi
+
+  if [ "$mode" = "key" ]; then
+    printf '%b\n' "${YELLOW}开启密钥登录并关闭密码登录前，请确认当前用户已配置可用公钥。${RESET}\n"
+    if ! confirm_action '确认继续'; then
+      printf '%b\n' "${YELLOW}已取消。${RESET}"
+      pause
+      return
+    fi
+  fi
+
+  backup="$(backup_file "$config_file")"
+
+  if [ "$mode" = "key" ]; then
+    set_ssh_option PubkeyAuthentication yes "$config_file"
+    set_ssh_option PasswordAuthentication no "$config_file"
+    set_ssh_option KbdInteractiveAuthentication no "$config_file"
+    set_ssh_option ChallengeResponseAuthentication no "$config_file"
+  else
+    set_ssh_option PubkeyAuthentication yes "$config_file"
+    set_ssh_option PasswordAuthentication yes "$config_file"
+    set_ssh_option KbdInteractiveAuthentication yes "$config_file"
+    set_ssh_option ChallengeResponseAuthentication yes "$config_file"
+  fi
+
+  if ! test_sshd_config "$config_file"; then
+    [ -n "$backup" ] && cp -a "$backup" "$config_file"
+    printf '%b\n' "${RED}SSH 配置检查失败，已恢复备份。${RESET}"
+    pause
+    return
+  fi
+
+  if restart_ssh_service; then
+    printf '%b\n' "${GREEN}SSH 登录模式已更新。${RESET}"
+  else
+    printf '%b\n' "${YELLOW}配置已写入，但 SSH 服务重启失败，请手动检查服务状态。${RESET}"
+  fi
+
+  [ -n "$backup" ] && printf '配置备份: %s\n' "$backup"
+  pause
+}
+
+ssh_key_login_menu() {
+  local choice=""
+
+  while true; do
+    clear_screen
+    print_header
+    show_ssh_login_status
+    print_separator
+    printf '%s\n' '1. 开启密钥登录并关闭密码登录'
+    printf '%s\n' '2. 开启密码登录'
+    printf '%s\n' '0. 返回'
+    print_footer
+
+    read -r -p '请输入选项: ' choice
+    case "$choice" in
+      1)
+        set_ssh_login_mode key
+        ;;
+      2)
+        set_ssh_login_mode password
+        ;;
+      0|r|R)
+        return
+        ;;
+      *)
+        printf '%b\n' "${RED}无效选项。${RESET}"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+detect_firewall_backend() {
+  if command_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    printf '%s\n' 'firewalld'
+  elif command_exists ufw; then
+    printf '%s\n' 'ufw'
+  elif command_exists iptables; then
+    printf '%s\n' 'iptables'
+  else
+    printf '%s\n' 'none'
+  fi
+}
+
+persist_iptables_rules() {
+  if command_exists netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 && return 0
+  fi
+
+  if command_exists rc-service && rc-service iptables save >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if command_exists service && service iptables save >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if command_exists iptables-save && [ -d /etc/iptables ]; then
+    iptables-save > /etc/iptables/rules.v4
+    if command_exists ip6tables-save; then
+      ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
+iptables_port_rule() {
+  local action="$1"
+  local port="$2"
+  local proto="$3"
+  local cmd
+
+  for cmd in iptables ip6tables; do
+    if ! command_exists "$cmd"; then
+      continue
+    fi
+
+    if [ "$action" = "open" ]; then
+      "$cmd" -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || \
+        "$cmd" -I INPUT -p "$proto" --dport "$port" -j ACCEPT
+    else
+      while "$cmd" -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+        :
+      done
+    fi
+  done
+}
+
+firewall_apply_port() {
+  local action="$1"
+  local port="$2"
+  local proto="$3"
+  local backend
+  local result=0
+
+  if [ "$proto" = "all" ]; then
+    firewall_apply_port "$action" "$port" tcp || result=1
+    firewall_apply_port "$action" "$port" udp || result=1
+    return "$result"
+  fi
+
+  backend="$(detect_firewall_backend)"
+  case "$backend" in
+    firewalld)
+      if [ "$action" = "open" ]; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null
+      else
+        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null
+      fi
+      firewall-cmd --reload >/dev/null
+      ;;
+    ufw)
+      if [ "$action" = "open" ]; then
+        ufw --force allow "${port}/${proto}"
+      else
+        ufw --force delete allow "${port}/${proto}"
+      fi
+      ;;
+    iptables)
+      iptables_port_rule "$action" "$port" "$proto"
+      persist_iptables_rules || printf '%b\n' "${YELLOW}iptables 规则已写入运行时，重启后是否保留取决于系统防火墙服务。${RESET}"
+      ;;
+    *)
+      printf '%b\n' "${RED}未检测到 firewalld、ufw 或 iptables。${RESET}"
+      return 1
+      ;;
+  esac
+}
+
+normalize_protocol() {
+  local proto="${1:-tcp}"
+
+  case "$proto" in
+    tcp|TCP)
+      printf '%s\n' 'tcp'
+      ;;
+    udp|UDP)
+      printf '%s\n' 'udp'
+      ;;
+    all|ALL|'')
+      printf '%s\n' 'all'
+      ;;
+    *)
+      printf '%s\n' ''
+      ;;
+  esac
+}
+
+open_firewall_port() {
+  local port="$1"
+  local proto="${2:-tcp}"
+  local quiet="${3:-}"
+
+  if ! valid_port "$port"; then
+    [ "$quiet" = "silent" ] || printf '%b\n' "${RED}端口无效。${RESET}"
+    return 1
+  fi
+
+  proto="$(normalize_protocol "$proto")"
+  if [ -z "$proto" ]; then
+    [ "$quiet" = "silent" ] || printf '%b\n' "${RED}协议无效。${RESET}"
+    return 1
+  fi
+
+  firewall_apply_port open "$port" "$proto"
+}
+
+manage_firewall_port() {
+  local action="$1"
+  local port=""
+  local proto=""
+
+  if ! require_root; then
+    pause
+    return
+  fi
+
+  read -r -p '请输入端口号: ' port
+  if ! valid_port "$port"; then
+    printf '%b\n' "${RED}端口无效。${RESET}"
+    pause
+    return
+  fi
+
+  read -r -p '请输入协议(tcp/udp/all，默认 all): ' proto
+  proto="$(normalize_protocol "$proto")"
+  if [ -z "$proto" ]; then
+    printf '%b\n' "${RED}协议无效。${RESET}"
+    pause
+    return
+  fi
+
+  if firewall_apply_port "$action" "$port" "$proto"; then
+    if [ "$action" = "open" ]; then
+      printf '%b\n' "${GREEN}端口已开放: ${port}/${proto}${RESET}"
+    else
+      printf '%b\n' "${GREEN}端口规则已移除: ${port}/${proto}${RESET}"
+    fi
+  fi
+
+  pause
+}
+
+show_firewall_rules() {
+  local backend
+
+  clear_screen
+  print_header
+  backend="$(detect_firewall_backend)"
+  printf '当前防火墙后端: %s\n' "$backend"
+  print_separator
+
+  case "$backend" in
+    firewalld)
+      firewall-cmd --list-ports
+      ;;
+    ufw)
+      ufw status numbered
+      ;;
+    iptables)
+      iptables -S INPUT 2>/dev/null | awk '/--dport/ { print }'
+      if command_exists ip6tables; then
+        ip6tables -S INPUT 2>/dev/null | awk '/--dport/ { print }'
+      fi
+      ;;
+    *)
+      printf '%s\n' '未检测到可管理的防火墙工具。'
+      ;;
+  esac
+
+  print_footer
+  pause
+}
+
+port_management_menu() {
+  local choice=""
+
+  while true; do
+    clear_screen
+    print_header
+    printf '%s\n' '1. 开放端口'
+    printf '%s\n' '2. 关闭端口'
+    printf '%s\n' '3. 查看端口规则'
+    printf '%s\n' '0. 返回'
+    print_footer
+
+    read -r -p '请输入选项: ' choice
+    case "$choice" in
+      1)
+        manage_firewall_port open
+        ;;
+      2)
+        manage_firewall_port close
+        ;;
+      3)
+        show_firewall_rules
+        ;;
+      0|r|R)
+        return
+        ;;
+      *)
+        printf '%b\n' "${RED}无效选项。${RESET}"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+swapfile_active() {
+  awk '$1 == "/swapfile" { found = 1 } END { exit found ? 0 : 1 }' /proc/swaps 2>/dev/null
+}
+
+remove_swapfile_from_fstab() {
+  local file="/etc/fstab"
+  local tmp_file
+
+  [ -f "$file" ] || touch "$file"
+  tmp_file="$(mktemp)"
+  awk '$1 != "/swapfile" { print }' "$file" > "$tmp_file"
+  cat "$tmp_file" > "$file"
+  rm -f "$tmp_file"
+}
+
+show_swap_status() {
+  if [ -r /proc/swaps ]; then
+    cat /proc/swaps
+  else
+    printf '%s\n' '无法读取 /proc/swaps'
+  fi
+}
+
+modify_swap_size() {
+  local size_gb=""
+  local count_mb
+  local backup
+
+  clear_screen
+  print_header
+  show_swap_status
+  print_separator
+
+  if ! require_root; then
+    pause
+    return
+  fi
+
+  read -r -p '请输入新的虚拟内存大小(GB，输入 0 删除 /swapfile): ' size_gb
+  if ! is_number "$size_gb"; then
+    printf '%b\n' "${RED}请输入数字。${RESET}"
+    pause
+    return
+  fi
+
+  backup="$(backup_file /etc/fstab)"
+
+  if swapfile_active; then
+    if ! swapoff /swapfile; then
+      printf '%b\n' "${RED}关闭现有 /swapfile 失败，请检查是否被占用。${RESET}"
+      pause
+      return
+    fi
+  fi
+
+  remove_swapfile_from_fstab
+  rm -f /swapfile
+
+  if [ "$size_gb" -eq 0 ]; then
+    printf '%b\n' "${GREEN}已删除 /swapfile 虚拟内存配置。${RESET}"
+    [ -n "$backup" ] && printf 'fstab 备份: %s\n' "$backup"
+    pause
+    return
+  fi
+
+  count_mb=$((size_gb * 1024))
+  printf '正在创建 %sGB swapfile...\n' "$size_gb"
+
+  if ! {
+    if command_exists fallocate; then
+      fallocate -l "${size_gb}G" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$count_mb"
+    else
+      dd if=/dev/zero of=/swapfile bs=1M count="$count_mb"
+    fi
+  }; then
+    rm -f /swapfile
+    printf '%b\n' "${RED}创建 swapfile 失败，请检查磁盘空间。${RESET}"
+    pause
+    return
+  fi
+
+  chmod 600 /swapfile
+  if ! mkswap /swapfile >/dev/null; then
+    rm -f /swapfile
+    printf '%b\n' "${RED}格式化 swapfile 失败。${RESET}"
+    pause
+    return
+  fi
+
+  if ! swapon /swapfile; then
+    rm -f /swapfile
+    printf '%b\n' "${RED}启用 swapfile 失败。${RESET}"
+    pause
+    return
+  fi
+
+  printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  printf '%b\n' "${GREEN}虚拟内存已设置为 ${size_gb}GB。${RESET}"
+  [ -n "$backup" ] && printf 'fstab 备份: %s\n' "$backup"
+  pause
+}
+
+sysctl_get() {
+  sysctl -n "$1" 2>/dev/null || true
+}
+
+sysctl_key_exists() {
+  [ -n "$(sysctl_get "$1")" ]
+}
+
+choose_bbr_algorithm() {
+  local available
+
+  available="$(sysctl_get net.ipv4.tcp_available_congestion_control)"
+  if ! printf ' %s ' "$available" | grep -q ' bbr'; then
+    command_exists modprobe && modprobe tcp_bbr >/dev/null 2>&1 || true
+    available="$(sysctl_get net.ipv4.tcp_available_congestion_control)"
+  fi
+
+  if printf ' %s ' "$available" | grep -q ' bbr3 '; then
+    printf '%s\n' 'bbr3'
+  elif printf ' %s ' "$available" | grep -q ' bbr '; then
+    printf '%s\n' 'bbr'
+  else
+    printf '%s\n' ''
+  fi
+}
+
+enable_bbr3() {
+  local algorithm
+  local config_file="/etc/sysctl.d/99-vps-bbr.conf"
+  local backup=""
+
+  clear_screen
+  print_header
+
+  if ! require_root; then
+    pause
+    return
+  fi
+
+  algorithm="$(choose_bbr_algorithm)"
+  if [ -z "$algorithm" ]; then
+    printf '%b\n' "${RED}当前内核未检测到 bbr/bbr3 拥塞控制算法，无法直接启用。${RESET}"
+    printf '%s\n' '请先更换支持 BBR3 或 BBR 的内核后再执行。'
+    pause
+    return
+  fi
+
+  mkdir -p /etc/sysctl.d
+  backup="$(backup_file "$config_file")"
+
+  {
+    printf '# VPS script BBR acceleration\n'
+    if sysctl_key_exists net.core.default_qdisc; then
+      printf 'net.core.default_qdisc = fq\n'
+    fi
+    printf 'net.ipv4.tcp_congestion_control = %s\n' "$algorithm"
+  } > "$config_file"
+
+  if ! sysctl -p "$config_file"; then
+    if [ -n "$backup" ]; then
+      cp -a "$backup" "$config_file"
+    else
+      rm -f "$config_file"
+    fi
+    printf '%b\n' "${RED}sysctl 配置应用失败，已恢复备份。${RESET}"
+    pause
+    return
+  fi
+
+  printf '%b\n' "${GREEN}已启用 ${algorithm} 加速。${RESET}"
+  printf '当前拥塞控制: %s\n' "$(sysctl_get net.ipv4.tcp_congestion_control)"
+  printf '当前队列算法: %s\n' "$(sysctl_get net.core.default_qdisc)"
+  if [ "$algorithm" = "bbr" ]; then
+    printf '%b\n' "${YELLOW}提示: 当前内核暴露的算法名为 bbr；如果内核实现是 BBR3，会通过该算法名生效。${RESET}"
+  fi
+  [ -n "$backup" ] && printf '配置备份: %s\n' "$backup"
+  print_footer
+  pause
+}
+
+system_tools_menu() {
+  local choice=""
+
+  while true; do
+    clear_screen
+    printf '%b\n' "${CYAN}--------系统工具 | 输入 r 返回主菜单----------${RESET}"
+    printf '%s\n' '1. 修改SSH连接端口'
+    printf '%s\n' '2. 切换优先IPv4/IPv6'
+    printf '%s\n' '3. 用户密钥登录模式'
+    printf '%s\n' '4. 开放端口管理'
+    printf '%s\n' '5. 修改虚拟内存大小'
+    printf '%s\n' '6. 设置BBR3加速'
+    printf '%s\n' '0. 返回'
+    print_footer
+
+    if [ -t 0 ]; then
+      read -r -p '请输入选项: ' choice
+    else
+      return 0
+    fi
+
+    case "$choice" in
+      1)
+        modify_ssh_port
+        ;;
+      2)
+        switch_ip_priority
+        ;;
+      3)
+        ssh_key_login_menu
+        ;;
+      4)
+        port_management_menu
+        ;;
+      5)
+        modify_swap_size
+        ;;
+      6)
+        enable_bbr3
+        ;;
+      0|r|R)
+        return
+        ;;
+      *)
+        printf '%b\n' "${RED}无效选项，请重新输入。${RESET}"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
 update_script() {
   local tmp_file
 
@@ -666,7 +1526,7 @@ main() {
         placeholder 'Docker管理'
         ;;
       4)
-        placeholder '系统工具'
+        system_tools_menu
         ;;
       5|u|U|update)
         update_script
