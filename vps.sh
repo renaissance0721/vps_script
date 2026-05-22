@@ -981,78 +981,355 @@ switch_ip_priority() {
   pause
 }
 
-show_ssh_login_status() {
-  local config_file
-  local pubkey
-  local password
-
-  config_file="$(find_sshd_config)"
-  if [ -z "$config_file" ]; then
-    printf '%b\n' "${RED}未找到 /etc/ssh/sshd_config。${RESET}"
-    return
-  fi
-
-  pubkey="$(get_ssh_option PubkeyAuthentication "$config_file")"
-  password="$(get_ssh_option PasswordAuthentication "$config_file")"
-
-  printf 'PubkeyAuthentication: %s\n' "${pubkey:-默认}"
-  printf 'PasswordAuthentication: %s\n' "${password:-默认}"
+get_ssh_dir() {
+  printf '%s\n' "${HOME:-/root}/.ssh"
 }
 
-set_ssh_login_mode() {
-  local mode="$1"
+get_authorized_keys_file() {
+  printf '%s\n' "$(get_ssh_dir)/authorized_keys"
+}
+
+ensure_authorized_keys_file() {
+  local ssh_dir
+  local auth_file
+
+  ssh_dir="$(get_ssh_dir)"
+  auth_file="$(get_authorized_keys_file)"
+
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  touch "$auth_file"
+  chmod 600 "$auth_file"
+}
+
+is_valid_public_key() {
+  local key="$1"
+
+  case "$key" in
+    ssh-rsa\ *|ssh-ed25519\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-nistp256@openssh.com\ *)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+fetch_text() {
+  local url="$1"
+
+  if command_exists curl; then
+    curl -fsSL --connect-timeout 8 --max-time 30 "$url"
+  elif command_exists wget; then
+    wget -qO- -T 30 -t 1 "$url"
+  else
+    return 1
+  fi
+}
+
+enable_pubkey_auth() {
   local config_file
   local backup
 
-  if ! require_root; then
-    pause
-    return
-  fi
-
   config_file="$(find_sshd_config)"
   if [ -z "$config_file" ]; then
-    printf '%b\n' "${RED}未找到 /etc/ssh/sshd_config。${RESET}"
-    pause
-    return
+    printf '%b\n' "${YELLOW}未找到 sshd_config，已跳过 SSH 服务配置。${RESET}"
+    return 0
   fi
 
-  if [ "$mode" = "key" ]; then
-    printf '%b\n' "${YELLOW}开启密钥登录并关闭密码登录前，请确认当前用户已配置可用公钥。${RESET}\n"
-    if ! confirm_action '确认继续'; then
-      printf '%b\n' "${YELLOW}已取消。${RESET}"
-      pause
-      return
-    fi
+  if [ "$(id -u)" -ne 0 ]; then
+    printf '%b\n' "${YELLOW}当前不是 root，已写入公钥，但不会修改 sshd_config。${RESET}"
+    return 0
   fi
 
   backup="$(backup_file "$config_file")"
-
-  if [ "$mode" = "key" ]; then
-    set_ssh_option PubkeyAuthentication yes "$config_file"
-    set_ssh_option PasswordAuthentication no "$config_file"
-    set_ssh_option KbdInteractiveAuthentication no "$config_file"
-    set_ssh_option ChallengeResponseAuthentication no "$config_file"
-  else
-    set_ssh_option PubkeyAuthentication yes "$config_file"
-    set_ssh_option PasswordAuthentication yes "$config_file"
-    set_ssh_option KbdInteractiveAuthentication yes "$config_file"
-    set_ssh_option ChallengeResponseAuthentication yes "$config_file"
-  fi
+  set_ssh_option PubkeyAuthentication yes "$config_file"
 
   if ! test_sshd_config "$config_file"; then
     [ -n "$backup" ] && cp -a "$backup" "$config_file"
     printf '%b\n' "${RED}SSH 配置检查失败，已恢复备份。${RESET}"
+    return 1
+  fi
+
+  if restart_ssh_service; then
+    printf '%b\n' "${GREEN}SSH 公钥认证已启用。${RESET}"
+  else
+    printf '%b\n' "${YELLOW}公钥已写入，但 SSH 服务重启失败，请手动检查服务状态。${RESET}"
+  fi
+
+  [ -n "$backup" ] && printf '配置备份: %s\n' "$backup"
+}
+
+add_public_key_line() {
+  local public_key="$1"
+  local auth_file
+
+  public_key="$(printf '%s\n' "$public_key" | awk '{$1=$1; print}')"
+  if ! is_valid_public_key "$public_key"; then
+    return 2
+  fi
+
+  ensure_authorized_keys_file
+  auth_file="$(get_authorized_keys_file)"
+
+  if grep -qxF "$public_key" "$auth_file" 2>/dev/null; then
+    return 1
+  fi
+
+  printf '%s\n' "$public_key" >> "$auth_file"
+  chmod 600 "$auth_file"
+  return 0
+}
+
+import_public_keys_from_text() {
+  local text="$1"
+  local line
+  local added=0
+  local duplicate=0
+  local invalid=0
+  local result
+
+  while IFS= read -r line; do
+    line="$(printf '%s\n' "$line" | sed 's/[[:space:]]*$//')"
+    [ -n "$line" ] || continue
+    if add_public_key_line "$line"; then
+      result=0
+    else
+      result=$?
+    fi
+    case "$result" in
+      0)
+        added=$((added + 1))
+        ;;
+      1)
+        duplicate=$((duplicate + 1))
+        ;;
+      *)
+        invalid=$((invalid + 1))
+        ;;
+    esac
+  done <<EOF
+$text
+EOF
+
+  printf '新增公钥: %s\n' "$added"
+  printf '重复公钥: %s\n' "$duplicate"
+  printf '无效行数: %s\n' "$invalid"
+
+  if [ "$added" -gt 0 ]; then
+    enable_pubkey_auth
+  else
+    printf '%b\n' "${YELLOW}没有新增公钥。${RESET}"
+  fi
+
+  return 0
+}
+
+generate_new_key_pair() {
+  local ssh_dir
+  local key_file
+  local comment
+
+  clear_screen
+  print_header
+
+  if ! command_exists ssh-keygen; then
+    printf '%b\n' "${RED}未找到 ssh-keygen，无法生成密钥对。${RESET}"
     pause
     return
   fi
 
-  if restart_ssh_service; then
-    printf '%b\n' "${GREEN}SSH 登录模式已更新。${RESET}"
-  else
-    printf '%b\n' "${YELLOW}配置已写入，但 SSH 服务重启失败，请手动检查服务状态。${RESET}"
+  ensure_authorized_keys_file
+  ssh_dir="$(get_ssh_dir)"
+  key_file="${ssh_dir}/id_ed25519_vps_$(date '+%Y%m%d%H%M%S')"
+  comment="vps-script@$(hostname 2>/dev/null || printf 'localhost')"
+
+  if ! ssh-keygen -t ed25519 -N "" -C "$comment" -f "$key_file"; then
+    printf '%b\n' "${RED}密钥生成失败。${RESET}"
+    pause
+    return
   fi
 
-  [ -n "$backup" ] && printf '配置备份: %s\n' "$backup"
+  add_public_key_line "$(cat "${key_file}.pub")" || true
+  enable_pubkey_auth
+
+  printf '%b\n' "${GREEN}密钥对已生成，并已将公钥加入 authorized_keys。${RESET}"
+  printf '私钥文件: %s\n' "$key_file"
+  printf '公钥文件: %s.pub\n' "$key_file"
+  print_separator
+  printf '%s\n' '私钥内容，请保存到本地后妥善保管:'
+  cat "$key_file"
+  print_separator
+  printf '%s\n' '公钥内容:'
+  cat "${key_file}.pub"
+  print_footer
+  pause
+}
+
+manual_input_public_key() {
+  local public_key
+  local result
+
+  clear_screen
+  print_header
+  read -r -p '请粘贴已有公钥: ' public_key
+
+  if add_public_key_line "$public_key"; then
+    result=0
+  else
+    result=$?
+  fi
+
+  case "$result" in
+    0)
+      enable_pubkey_auth
+      printf '%b\n' "${GREEN}公钥已添加。${RESET}"
+      ;;
+    1)
+      printf '%b\n' "${YELLOW}该公钥已存在，无需重复添加。${RESET}"
+      ;;
+    *)
+      printf '%b\n' "${RED}公钥格式无效。${RESET}"
+      ;;
+  esac
+
+  print_footer
+  pause
+}
+
+import_public_key_from_github() {
+  local username
+  local text
+
+  clear_screen
+  print_header
+  read -r -p '请输入 GitHub 用户名: ' username
+
+  if ! [[ "$username" =~ ^[A-Za-z0-9-]+$ ]]; then
+    printf '%b\n' "${RED}GitHub 用户名格式无效。${RESET}"
+    pause
+    return
+  fi
+
+  if ! text="$(fetch_text "https://github.com/${username}.keys")" || [ -z "$text" ]; then
+    printf '%b\n' "${RED}未能从 GitHub 获取公钥。${RESET}"
+    pause
+    return
+  fi
+
+  import_public_keys_from_text "$text"
+  print_footer
+  pause
+}
+
+import_public_key_from_url() {
+  local url
+  local text
+
+  clear_screen
+  print_header
+  read -r -p '请输入公钥 URL: ' url
+
+  case "$url" in
+    http://*|https://*)
+      ;;
+    *)
+      printf '%b\n' "${RED}URL 必须以 http:// 或 https:// 开头。${RESET}"
+      pause
+      return
+      ;;
+  esac
+
+  if ! text="$(fetch_text "$url")" || [ -z "$text" ]; then
+    printf '%b\n' "${RED}未能从 URL 获取公钥。${RESET}"
+    pause
+    return
+  fi
+
+  import_public_keys_from_text "$text"
+  print_footer
+  pause
+}
+
+edit_authorized_keys_file() {
+  local auth_file
+  local editor=""
+
+  clear_screen
+  print_header
+  ensure_authorized_keys_file
+  auth_file="$(get_authorized_keys_file)"
+
+  if [ -n "${EDITOR:-}" ] && command_exists "$EDITOR"; then
+    editor="$EDITOR"
+  elif command_exists nano; then
+    editor="nano"
+  elif command_exists vi; then
+    editor="vi"
+  fi
+
+  if [ -z "$editor" ]; then
+    printf '%b\n' "${RED}未找到可用编辑器，请手动编辑: ${auth_file}${RESET}"
+    pause
+    return
+  fi
+
+  "$editor" "$auth_file"
+  chmod 600 "$auth_file"
+  enable_pubkey_auth
+  printf '%b\n' "${GREEN}公钥文件已保存: ${auth_file}${RESET}"
+  pause
+}
+
+view_local_keys() {
+  local ssh_dir
+  local auth_file
+  local pub_file
+  local private_found=0
+
+  clear_screen
+  print_header
+  ssh_dir="$(get_ssh_dir)"
+  auth_file="$(get_authorized_keys_file)"
+
+  printf 'SSH目录: %s\n' "$ssh_dir"
+  print_separator
+
+  if [ -s "$auth_file" ]; then
+    printf '%s\n' 'authorized_keys:'
+    nl -ba "$auth_file"
+  else
+    printf '%s\n' 'authorized_keys: 空或不存在'
+  fi
+
+  print_separator
+  printf '%s\n' '本机公钥文件:'
+  if ls "$ssh_dir"/*.pub >/dev/null 2>&1; then
+    for pub_file in "$ssh_dir"/*.pub; do
+      printf '\n[%s]\n' "$pub_file"
+      cat "$pub_file"
+    done
+  else
+    printf '%s\n' '未找到 .pub 公钥文件'
+  fi
+
+  print_separator
+  printf '%s\n' '本机私钥文件:'
+  if [ -d "$ssh_dir" ]; then
+    for pub_file in "$ssh_dir"/id_* "$ssh_dir"/*.pem; do
+      [ -f "$pub_file" ] || continue
+      case "$pub_file" in
+        *.pub)
+          continue
+          ;;
+      esac
+      private_found=1
+      printf '%s\n' "$pub_file"
+    done
+  fi
+
+  [ "$private_found" -eq 1 ] || printf '%s\n' '未找到常见私钥文件'
+  print_footer
   pause
 }
 
@@ -1062,10 +1339,12 @@ ssh_key_login_menu() {
   while true; do
     clear_screen
     print_header
-    show_ssh_login_status
-    print_separator
-    printf '%s\n' '1. 开启密钥登录并关闭密码登录'
-    printf '%s\n' '2. 开启密码登录'
+    printf '%s\n' '1. 生成新密钥对'
+    printf '%s\n' '2. 手动输入已有公钥'
+    printf '%s\n' '3. 从GitHub导入已有公钥'
+    printf '%s\n' '4. 从URL导入已有公钥'
+    printf '%s\n' '5. 编辑公钥文件'
+    printf '%s\n' '6. 查看本机密钥'
     printf '%s\n' '0. 返回'
     printf '%s\n' '00. 退出脚本'
     print_footer
@@ -1073,10 +1352,22 @@ ssh_key_login_menu() {
     read -r -p '请输入选项: ' choice
     case "$choice" in
       1)
-        set_ssh_login_mode key
+        generate_new_key_pair
         ;;
       2)
-        set_ssh_login_mode password
+        manual_input_public_key
+        ;;
+      3)
+        import_public_key_from_github
+        ;;
+      4)
+        import_public_key_from_url
+        ;;
+      5)
+        edit_authorized_keys_file
+        ;;
+      6)
+        view_local_keys
         ;;
       0|r|R)
         return 0
