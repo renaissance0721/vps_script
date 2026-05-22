@@ -5,9 +5,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="VPS一键管理脚本"
 REPO="${REPO:-renaissance0721/vps_script}"
 BRANCH="${BRANCH:-main}"
-INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/vps}"
-SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/r}"
-INSTALLER_URL="${INSTALLER_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh}"
+SOURCE_URL="${SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/vps.sh}"
 
 if [ -t 1 ]; then
   RED='\033[31m'
@@ -75,20 +73,6 @@ http_get() {
   elif command_exists wget; then
     wget -qO- -T 8 -t 1 "$url"
   else
-    return 1
-  fi
-}
-
-download_file() {
-  local url="$1"
-  local output="$2"
-
-  if command_exists curl; then
-    curl -fsSL --connect-timeout 8 --max-time 30 "$url" -o "$output"
-  elif command_exists wget; then
-    wget -qO "$output" "$url"
-  else
-    printf '%b\n' "${RED}未找到 curl 或 wget，无法下载脚本。${RESET}" >&2
     return 1
   fi
 }
@@ -819,6 +803,7 @@ set_gai_priority() {
   tmp_file="$(mktemp)"
 
   awk '
+    /^[[:space:]]*# VPS script network priority/ { next }
     /^[[:space:]]*#?[[:space:]]*precedence[[:space:]]+::ffff:0:0\/96[[:space:]]+/ { next }
     /^[[:space:]]*#?[[:space:]]*precedence[[:space:]]+::\/0[[:space:]]+/ { next }
     { print }
@@ -828,11 +813,13 @@ set_gai_priority() {
   rm -f "$tmp_file"
 
   {
-    printf '\n'
-    printf '# VPS script network priority\n'
     if [ "$mode" = "ipv4" ]; then
+      printf '\n'
+      printf '# VPS script network priority\n'
       printf 'precedence ::ffff:0:0/96  100\n'
-    else
+    elif [ "$mode" = "ipv6" ]; then
+      printf '\n'
+      printf '# VPS script network priority\n'
       printf 'precedence ::/0  100\n'
       printf 'precedence ::ffff:0:0/96  10\n'
     fi
@@ -840,11 +827,43 @@ set_gai_priority() {
 
   if [ "$mode" = "ipv4" ]; then
     printf '%b\n' "${GREEN}已设置为优先 IPv4。${RESET}"
-  else
+  elif [ "$mode" = "ipv6" ]; then
     printf '%b\n' "${GREEN}已设置为优先 IPv6。${RESET}"
+  else
+    printf '%b\n' "${GREEN}已恢复为系统默认 IPv4/IPv6 优先级配置。${RESET}"
   fi
 
   [ -n "$backup" ] && printf '配置备份: %s\n' "$backup"
+}
+
+get_current_ip_priority() {
+  local file="/etc/gai.conf"
+
+  if [ ! -r "$file" ]; then
+    printf '%s\n' '默认配置'
+    return
+  fi
+
+  awk '
+    /^[[:space:]]*#/ { next }
+    $1 == "precedence" && $2 == "::ffff:0:0/96" {
+      ipv4 = $3 + 0
+      seen4 = 1
+    }
+    $1 == "precedence" && $2 == "::/0" {
+      ipv6 = $3 + 0
+      seen6 = 1
+    }
+    END {
+      if (seen4 && (!seen6 || ipv4 > ipv6)) {
+        print "优先 IPv4"
+      } else if (seen6 && (!seen4 || ipv6 > ipv4)) {
+        print "优先 IPv6"
+      } else {
+        print "默认配置"
+      }
+    }
+  ' "$file"
 }
 
 switch_ip_priority() {
@@ -852,9 +871,13 @@ switch_ip_priority() {
 
   clear_screen
   print_header
+  printf '当前优先: %s\n' "$(get_current_ip_priority)"
+  print_separator
   printf '%s\n' '1. 优先 IPv4'
   printf '%s\n' '2. 优先 IPv6'
+  printf '%s\n' '3. 默认配置'
   printf '%s\n' '0. 返回'
+  printf '%s\n' '00. 退出脚本'
   print_footer
 
   read -r -p '请输入选项: ' choice
@@ -865,8 +888,15 @@ switch_ip_priority() {
     2)
       set_gai_priority ipv6
       ;;
+    3)
+      set_gai_priority default
+      ;;
     0)
       return
+      ;;
+    00)
+      printf '%b\n' "${GREEN}已退出。${RESET}"
+      exit 0
       ;;
     *)
       printf '%b\n' "${RED}无效选项。${RESET}"
@@ -962,6 +992,7 @@ ssh_key_login_menu() {
     printf '%s\n' '1. 开启密钥登录并关闭密码登录'
     printf '%s\n' '2. 开启密码登录'
     printf '%s\n' '0. 返回'
+    printf '%s\n' '00. 退出脚本'
     print_footer
 
     read -r -p '请输入选项: ' choice
@@ -974,6 +1005,10 @@ ssh_key_login_menu() {
         ;;
       0|r|R)
         return
+        ;;
+      00)
+        printf '%b\n' "${GREEN}已退出。${RESET}"
+        exit 0
         ;;
       *)
         printf '%b\n' "${RED}无效选项。${RESET}"
@@ -1197,6 +1232,7 @@ port_management_menu() {
     printf '%s\n' '2. 关闭端口'
     printf '%s\n' '3. 查看端口规则'
     printf '%s\n' '0. 返回'
+    printf '%s\n' '00. 退出脚本'
     print_footer
 
     read -r -p '请输入选项: ' choice
@@ -1212,6 +1248,10 @@ port_management_menu() {
         ;;
       0|r|R)
         return
+        ;;
+      00)
+        printf '%b\n' "${GREEN}已退出。${RESET}"
+        exit 0
         ;;
       *)
         printf '%b\n' "${RED}无效选项。${RESET}"
@@ -1417,6 +1457,7 @@ system_tools_menu() {
     printf '%s\n' '5. 修改虚拟内存大小'
     printf '%s\n' '6. 设置BBR3加速'
     printf '%s\n' '0. 返回'
+    printf '%s\n' '00. 退出脚本'
     print_footer
 
     if [ -t 0 ]; then
@@ -1447,6 +1488,10 @@ system_tools_menu() {
       0|r|R)
         return
         ;;
+      00)
+        printf '%b\n' "${GREEN}已退出。${RESET}"
+        exit 0
+        ;;
       *)
         printf '%b\n' "${RED}无效选项，请重新输入。${RESET}"
         sleep 1
@@ -1456,40 +1501,26 @@ system_tools_menu() {
 }
 
 update_script() {
-  local tmp_file
-
   clear_screen
   print_header
-  printf '%b\n' "${YELLOW}正在从 GitHub 拉取最新安装脚本...${RESET}"
 
-  tmp_file="$(mktemp)"
-
-  if ! download_file "$INSTALLER_URL" "$tmp_file"; then
-    rm -f "$tmp_file"
-    printf '%b\n' "${RED}下载失败，请检查网络或稍后重试。${RESET}"
+  if ! command_exists curl; then
+    printf '%b\n' "${RED}未找到 curl，无法拉取最新脚本。${RESET}"
+    printf '%s\n' 'Debian/Ubuntu: apt update && apt install -y curl'
+    printf '%s\n' 'Alpine: apk add --no-cache curl'
     pause
     return
   fi
 
-  if ! bash -n "$tmp_file"; then
-    rm -f "$tmp_file"
-    printf '%b\n' "${RED}最新安装脚本语法检查失败，已停止更新。${RESET}"
-    pause
-    return
-  fi
-
-  if ! REPO="$REPO" BRANCH="$BRANCH" INSTALL_PATH="$INSTALL_PATH" SHORTCUT_PATH="$SHORTCUT_PATH" bash "$tmp_file"; then
-    rm -f "$tmp_file"
-    printf '%b\n' "${RED}更新失败，请检查上方错误信息。${RESET}"
-    pause
-    return
-  fi
-
-  rm -f "$tmp_file"
-  printf '%b\n' "${GREEN}更新完成。输入 vps 或 r 可打开菜单。${RESET}"
-
+  printf '%b\n' "${YELLOW}正在从 GitHub 拉取并运行最新脚本...${RESET}"
+  printf 'bash <(curl -fsSL %s)\n' "$SOURCE_URL"
   print_footer
-  pause
+
+  if ! bash <(curl -fsSL "$SOURCE_URL"); then
+    printf '%b\n' "${RED}运行最新脚本失败，请检查网络或 GitHub 地址。${RESET}"
+    pause
+    return
+  fi
 }
 
 show_menu() {
