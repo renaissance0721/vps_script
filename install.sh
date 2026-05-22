@@ -7,6 +7,7 @@ BRANCH="${BRANCH:-main}"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/vps}"
 SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/r}"
 SOURCE_URL="${SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/vps.sh}"
+TMP_FILE=""
 
 if [ -t 1 ]; then
   GREEN='\033[32m'
@@ -24,9 +25,17 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+cleanup() {
+  if [ -n "${TMP_FILE:-}" ]; then
+    rm -f "$TMP_FILE"
+  fi
+}
+
 run_as_root() {
   if [ "$(id -u)" -eq 0 ]; then
     "$@"
+  elif "$@" 2>/dev/null; then
+    return 0
   elif command_exists sudo; then
     sudo "$@"
   else
@@ -52,6 +61,8 @@ download() {
 }
 
 main() {
+  trap cleanup EXIT
+
   if ! command_exists bash; then
     printf '%b\n' "${RED}未找到 bash，请先安装 bash。${RESET}" >&2
     printf '%s\n' 'Debian/Ubuntu: apt update && apt install -y bash'
@@ -59,20 +70,18 @@ main() {
     exit 1
   fi
 
-  local tmp_file
-  tmp_file="$(mktemp)"
-  trap 'rm -f "$tmp_file"' EXIT
+  TMP_FILE="$(mktemp)"
 
   printf '%b\n' "${YELLOW}正在下载 VPS 管理脚本...${RESET}"
-  download "$SOURCE_URL" "$tmp_file"
+  download "$SOURCE_URL" "$TMP_FILE"
 
-  if ! bash -n "$tmp_file"; then
+  if ! bash -n "$TMP_FILE"; then
     printf '%b\n' "${RED}脚本语法检查失败，已停止安装。${RESET}" >&2
     exit 1
   fi
 
   run_as_root mkdir -p "$(dirname "$INSTALL_PATH")"
-  run_as_root cp "$tmp_file" "$INSTALL_PATH"
+  run_as_root cp "$TMP_FILE" "$INSTALL_PATH"
   run_as_root chmod 0755 "$INSTALL_PATH"
 
   printf '%b\n' "${GREEN}安装完成。${RESET}"
