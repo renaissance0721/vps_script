@@ -1438,6 +1438,55 @@ detect_firewall_backend() {
   fi
 }
 
+install_firewall_backend() {
+  printf '%b\n' "${YELLOW}未检测到 firewalld、ufw 或 iptables，正在自动安装 iptables...${RESET}" >&2
+
+  if command_exists apk; then
+    apk add --no-cache iptables >&2
+  elif command_exists apt-get; then
+    apt-get update >&2
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables >&2
+  elif command_exists dnf; then
+    dnf install -y iptables iptables-services >&2
+  elif command_exists yum; then
+    yum install -y iptables iptables-services >&2
+  else
+    printf '%b\n' "${RED}未检测到支持的包管理器，无法自动安装 iptables。${RESET}" >&2
+    return 1
+  fi
+
+  if command_exists iptables; then
+    printf '%b\n' "${GREEN}iptables 安装完成。${RESET}" >&2
+    return 0
+  fi
+
+  printf '%b\n' "${RED}iptables 安装后仍不可用，请手动检查系统环境。${RESET}" >&2
+  return 1
+}
+
+ensure_firewall_backend() {
+  local backend
+
+  backend="$(detect_firewall_backend)"
+  if [ "$backend" != "none" ]; then
+    printf '%s\n' "$backend"
+    return 0
+  fi
+
+  if ! install_firewall_backend; then
+    printf '%s\n' 'none'
+    return 1
+  fi
+
+  backend="$(detect_firewall_backend)"
+  if [ "$backend" = "none" ]; then
+    printf '%s\n' 'none'
+    return 1
+  fi
+
+  printf '%s\n' "$backend"
+}
+
 persist_iptables_rules() {
   if command_exists netfilter-persistent; then
     netfilter-persistent save >/dev/null 2>&1 && return 0
@@ -1497,7 +1546,11 @@ firewall_apply_port() {
     return "$result"
   fi
 
-  backend="$(detect_firewall_backend)"
+  if ! backend="$(ensure_firewall_backend)"; then
+    printf '%b\n' "${RED}未检测到 firewalld、ufw 或 iptables，且自动安装失败。${RESET}"
+    return 1
+  fi
+
   case "$backend" in
     firewalld)
       if [ "$action" = "open" ]; then
