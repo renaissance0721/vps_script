@@ -8,6 +8,8 @@
 curl -fsSL https://raw.githubusercontent.com/renaissance0721/vps_script/main/install.sh | bash
 ```
 
+这条命令会从 GitHub 拉取最新脚本并安装到 `/usr/local/bin/vps`，同时创建快捷命令 `r`。
+
 如果系统没有 `curl`，可以使用：
 
 ```bash
@@ -25,6 +27,14 @@ apk add --no-cache bash curl
 ```bash
 vps
 ```
+
+或直接输入：
+
+```bash
+r
+```
+
+脚本菜单内也可以选择 `5. 一键更新`，从 GitHub 拉取最新版本。
 
 也可以不安装，直接运行：
 

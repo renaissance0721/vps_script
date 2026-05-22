@@ -3,6 +3,11 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="VPS一键管理脚本"
+REPO="${REPO:-renaissance0721/vps_script}"
+BRANCH="${BRANCH:-main}"
+INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/vps}"
+SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/r}"
+SOURCE_URL="${SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/vps.sh}"
 
 if [ -t 1 ]; then
   RED='\033[31m'
@@ -70,6 +75,31 @@ http_get() {
   elif command_exists wget; then
     wget -qO- -T 8 -t 1 "$url"
   else
+    return 1
+  fi
+}
+
+download_file() {
+  local url="$1"
+  local output="$2"
+
+  if command_exists curl; then
+    curl -fsSL --connect-timeout 8 --max-time 30 "$url" -o "$output"
+  elif command_exists wget; then
+    wget -qO "$output" "$url"
+  else
+    printf '%b\n' "${RED}未找到 curl 或 wget，无法下载脚本。${RESET}" >&2
+    return 1
+  fi
+}
+
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif command_exists sudo; then
+    sudo "$@"
+  else
+    printf '%b\n' "${RED}需要 root 权限，请使用 root 用户执行或安装 sudo。${RESET}" >&2
     return 1
   fi
 }
@@ -576,6 +606,59 @@ placeholder() {
   pause
 }
 
+update_script() {
+  local tmp_file
+
+  clear_screen
+  print_header
+  printf '%b\n' "${YELLOW}正在从 GitHub 拉取最新脚本...${RESET}"
+
+  tmp_file="$(mktemp)"
+
+  if ! download_file "$SOURCE_URL" "$tmp_file"; then
+    rm -f "$tmp_file"
+    printf '%b\n' "${RED}下载失败，请检查网络或稍后重试。${RESET}"
+    pause
+    return
+  fi
+
+  if ! bash -n "$tmp_file"; then
+    rm -f "$tmp_file"
+    printf '%b\n' "${RED}最新脚本语法检查失败，已停止更新。${RESET}"
+    pause
+    return
+  fi
+
+  if ! run_as_root mkdir -p "$(dirname "$INSTALL_PATH")"; then
+    rm -f "$tmp_file"
+    pause
+    return
+  fi
+
+  if ! run_as_root cp "$tmp_file" "$INSTALL_PATH"; then
+    rm -f "$tmp_file"
+    printf '%b\n' "${RED}写入 ${INSTALL_PATH} 失败。${RESET}"
+    pause
+    return
+  fi
+
+  rm -f "$tmp_file"
+  if ! run_as_root chmod 0755 "$INSTALL_PATH"; then
+    printf '%b\n' "${RED}设置执行权限失败。${RESET}"
+    pause
+    return
+  fi
+
+  if run_as_root ln -sf "$INSTALL_PATH" "$SHORTCUT_PATH"; then
+    printf '%b\n' "${GREEN}更新完成。输入 vps 或 r 可打开菜单。${RESET}"
+  else
+    printf '%b\n' "${YELLOW}脚本已更新，但快捷命令 r 创建失败。${RESET}"
+  fi
+
+  print_footer
+  pause
+}
+
 show_menu() {
   clear_screen
   print_header
@@ -583,6 +666,8 @@ show_menu() {
   printf '%s\n' '2. 节点管理'
   printf '%s\n' '3. Docker管理'
   printf '%s\n' '4. 系统工具'
+  printf '%s\n' '5. 一键更新'
+  printf '%s\n' 'r. 打开菜单'
   printf '%s\n' '0. 退出'
   print_footer
 }
@@ -610,6 +695,11 @@ main() {
         ;;
       4)
         placeholder '系统工具'
+        ;;
+      5|u|U|update)
+        update_script
+        ;;
+      r|R)
         ;;
       0|q|Q|exit|quit)
         printf '%b\n' "${GREEN}已退出。${RESET}"

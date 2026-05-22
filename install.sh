@@ -5,6 +5,7 @@ set -Eeuo pipefail
 REPO="${REPO:-renaissance0721/vps_script}"
 BRANCH="${BRANCH:-main}"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/vps}"
+SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/r}"
 SOURCE_URL="${SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/vps.sh}"
 
 if [ -t 1 ]; then
@@ -77,6 +78,12 @@ main() {
   printf '%b\n' "${GREEN}安装完成。${RESET}"
   printf '运行命令: %s\n' "$INSTALL_PATH"
   printf '快捷命令: %s\n' "$(basename "$INSTALL_PATH")"
+
+  if run_as_root ln -sf "$INSTALL_PATH" "$SHORTCUT_PATH"; then
+    printf '菜单快捷键: %s\n' "$(basename "$SHORTCUT_PATH")"
+  else
+    printf '%b\n' "${YELLOW}快捷命令 r 创建失败，可继续使用 vps 打开菜单。${RESET}"
+  fi
 }
 
 main "$@"
